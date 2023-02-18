@@ -512,12 +512,12 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* Extract profile from shared memory */
+		LWLockAcquire(pgws_profile_lock, LW_SHARED);
 		profile_count = hash_get_num_entries(pgws_profile_hash);
 		profile = (ProfileHashEntry *)
 			palloc(sizeof(ProfileHashEntry) * profile_count);
 
 		entry_index = 0;
-		LWLockAcquire(pgws_profile_lock, LW_SHARED);
 		hash_seq_init(&hash_seq, pgws_profile_hash);
 		while ((entry = hash_seq_search(&hash_seq)) != NULL)
 		{
