@@ -69,4 +69,8 @@ WaitLatchCompat(Latch *latch, int wakeEvents, long timeout,
 #define GetPGProcByNumber(n) (&ProcGlobal->allProcs[(n)])
 #endif
 
+#if PG_VERSION_NUM < 130000
+#define SignalHandlerForConfigReload PostgresSigHupHandler
+#endif
+
 #endif

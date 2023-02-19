@@ -63,12 +63,12 @@ extern History		*pgws_history_ring;
 extern LWLock		*pgws_history_lock;
 
 /* global settings */
-extern int MaxProfileEntries;
-extern int HistoryBufferSize;
-extern int HistoryPeriod;
-extern int ProfilePeriod;
-extern bool WhetherProfilePid;
-extern bool WhetherProfileQueryId;
+extern int pgwsMaxProfileEntries;
+extern int pgwsHistoryBufferSize;
+extern int pgwsHistoryPeriod;
+extern int pgwsProfilePeriod;
+extern bool pgwsWhetherProfilePid;
+extern bool pgwsWhetherProfileQueryId;
 
 /* collector.c */
 extern PGDLLEXPORT void pgws_collector_main(Datum main_arg);

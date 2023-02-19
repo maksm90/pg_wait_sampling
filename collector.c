@@ -30,19 +30,19 @@ static const double USAGE_INCREASE = 1.0;
 static const double USAGE_DECREASE_FACTOR = 0.99;
 static const int USAGE_DEALLOC_PERCENT = 5;
 static const int USAGE_DEALLOC_MIN_NUM = 10;
-static volatile sig_atomic_t shutdown_requested = false;
 
-static void handle_sigterm(SIGNAL_ARGS);
-
+#if PG_VERSION_NUM < 130000
+static volatile sig_atomic_t ShutdownRequestPending = false;
 static void
-handle_sigterm(SIGNAL_ARGS)
+SignalHandlerForShutdownRequest(SIGNAL_ARGS)
 {
 	int save_errno = errno;
-	shutdown_requested = true;
+	ShutdownRequestPending = true;
 	if (MyProc)
 		SetLatch(&MyProc->procLatch);
 	errno = save_errno;
 }
+#endif
 
 /*
  * qsort comparator for sorting into increasing usage order
@@ -121,32 +121,27 @@ probe_waits(const bool write_history, const bool write_profile)
 		LWLockAcquire(pgws_history_lock, LW_EXCLUSIVE);
 
 	/*
-	 * Iterate PGPROCs under shared lock.
-	 *
-	 * TODO:
-	 * ProcArrayLock is heavy enough and in current case we might perform the
-	 * non-trivial deallocation routine for profile hash table under this lock.
-	 * Therefore to reduce possible contention it's worth to segregate the logic
-	 * of PGPROCs iteration under ProcArrayLock and storing results to profile
-	 * and/or history under corresponding another lock.
+	 * Iterate PGPROCs
 	 */
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
 	for (int i = 0; i < ProcGlobal->allProcCount; i++)
 	{
 		PGPROC	   *proc = GetPGProcByNumber(i);
-		pgwsQueryId queryId = WhetherProfileQueryId ? pgws_proc_queryids[i] : 0;
-		int32 	 	wait_event_info = proc->wait_event_info,
-					pid = proc->pid;
+		pgwsQueryId queryId =
+			pgwsWhetherProfileQueryId ? pgws_proc_queryids[i] : 0;
+		uint32 	 	wait_event_info = proc->wait_event_info;
+		pid_t		pid = proc->pid;
 
 		/*
-		 * FIXME: zero pid actually doesn't indicate that process slot is freed.
+		 * FIXME:
+		 * Non-zero pid actually doesn't imply that process slot is not freed.
 		 * After process termination this field becomes unchanged and thereby
 		 * stores the pid of previous process. The possible indicator of process
 		 * termination might be a condition `proc->procLatch->owner_pid == 0`.
-		 * But even in this case ProcArrayLock doesn't protect `owner_pid`
-		 * field from concurrent modifications that might cause race conditions.
+		 * However, there is no any way to protect `owner_pid` field from
+		 * concurrent modifications. So its using might result in race
+		 * conditions.
 		 *
-		 * Abother option is to use the lists of freed PGPROCs from ProcGlocal:
+		 * Another option is to use the lists of freed PGPROCs from ProcGlocal:
 		 * freeProcs, walsenderFreeProcs, bgworkerFreeProcs and autovacFreeProcs
 		 * to define indexes of all freed slots in allProcs. But this requires
 		 * acquiring ProcStructLock spinlock that is impractical for iteration
@@ -169,7 +164,7 @@ probe_waits(const bool write_history, const bool write_profile)
 		/* Write to the history if needed */
 		if (write_history)
 		{
-			int index = pgws_history_ring->index % HistoryBufferSize;
+			int index = pgws_history_ring->index % pgwsHistoryBufferSize;
 
 			pgws_history_ring->items[index] = (HistoryItem) {
 				pid, wait_event_info, queryId, GetCurrentTimestamp()
@@ -184,7 +179,7 @@ probe_waits(const bool write_history, const bool write_profile)
 			ProfileHashEntry   *entry;
 
 			/* Set up key for hashtable search */
-			key.pid = WhetherProfilePid ? pid : 0;
+			key.pid = pgwsWhetherProfilePid ? pid : 0;
 			key.wait_event_info = wait_event_info;
 			key.queryid = queryId;
 
@@ -197,7 +192,7 @@ probe_waits(const bool write_history, const bool write_profile)
 			{
 
 				/* Make space if needed */
-				while (hash_get_num_entries(pgws_profile_hash) >= MaxProfileEntries)
+				while (hash_get_num_entries(pgws_profile_hash) >= pgwsMaxProfileEntries)
 					pgws_entry_dealloc();
 
 				entry = (ProfileHashEntry *)
@@ -214,7 +209,6 @@ probe_waits(const bool write_history, const bool write_profile)
 			}
 		}
 	}
-	LWLockRelease(ProcArrayLock);
 
 	if (write_history)
 		LWLockRelease(pgws_history_lock);
@@ -250,29 +244,16 @@ pgws_collector_main(Datum main_arg)
 	/*
 	 * Establish signal handlers.
 	 *
-	 * We want CHECK_FOR_INTERRUPTS() to kill off this worker process just as
-	 * it would a normal user backend.  To make that happen, we establish a
-	 * signal handler that is a stripped-down version of die().  We don't have
-	 * any equivalent of the backend's command-read loop, where interrupts can
-	 * be processed immediately, so make sure ImmediateInterruptOK is turned
-	 * off.
-	 *
-	 * We also want to respond to the ProcSignal notifications.  This is done
-	 * in the upstream provided procsignal_sigusr1_handler, which is
-	 * automatically used if a bgworker connects to a database.  But since our
-	 * worker doesn't connect to any database even though it calls
-	 * InitPostgres, which will still initializze a new backend and thus
-	 * partitipate to the ProcSignal infrastructure.
+	 * We want to respond to the ProcSignal notifications.  This is done in the
+	 * upstream provided procsignal_sigusr1_handler, which is automatically used
+	 * if a bgworker connects to a database. But since our worker doesn't
+	 * connect to any database even though it calls InitPostgres, which will
+	 * still initializze a new backend and thus partitipate to the ProcSignal
+	 * infrastructure.
 	 */
-	pqsignal(SIGTERM, handle_sigterm);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
-	pqsignal(SIGHUP,
-#if PG_VERSION_NUM >= 130000
-			SignalHandlerForConfigReload
-#else
-			PostgresSigHupHandler
-#endif
-			);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 	InitPostgresCompat(NULL, InvalidOid, NULL, InvalidOid, false, false, NULL);
 	SetProcessingMode(NormalProcessing);
@@ -310,7 +291,7 @@ pgws_collector_main(Datum main_arg)
 		}
 
 		/* Shutdown if requested */
-		if (shutdown_requested)
+		if (ShutdownRequestPending)
 			break;
 
 		/* Calculate time for the next sample of history or profile */
@@ -319,10 +300,10 @@ pgws_collector_main(Datum main_arg)
 		profile_diff = millisecs_diff(profile_ts, current_ts);
 
 		/* Write profile or history */
-		write_history = HistoryPeriod &&
-			(history_diff >= (int64) HistoryPeriod);
-		write_profile = ProfilePeriod &&
-			(profile_diff >= (int64) ProfilePeriod);
+		write_history = pgwsHistoryPeriod &&
+			(history_diff >= (int64) pgwsHistoryPeriod);
+		write_profile = pgwsProfilePeriod &&
+			(profile_diff >= (int64) pgwsProfilePeriod);
 		if (write_history || write_profile)
 		{
 			probe_waits(write_history, write_profile);
@@ -341,22 +322,22 @@ pgws_collector_main(Datum main_arg)
 		}
 
 		/* Wait until next sample time */
-		history_timeout = HistoryPeriod >= (int) history_diff ?
-			HistoryPeriod - (int) history_diff : 0;
-		profile_timeout = ProfilePeriod >= (int) profile_diff ?
-			ProfilePeriod - (int) profile_diff : 0;
+		history_timeout = pgwsHistoryPeriod >= (int) history_diff ?
+			pgwsHistoryPeriod - (int) history_diff : 0;
+		profile_timeout = pgwsProfilePeriod >= (int) profile_diff ?
+			pgwsProfilePeriod - (int) profile_diff : 0;
 
 		actual_timeout = 0;
-		if (ProfilePeriod && !HistoryPeriod)
+		if (pgwsProfilePeriod && !pgwsHistoryPeriod)
 			actual_timeout = profile_timeout;
-		else if (HistoryPeriod && !ProfilePeriod)
+		else if (pgwsHistoryPeriod && !pgwsProfilePeriod)
 			actual_timeout = history_timeout;
-		else if (HistoryPeriod && ProfilePeriod)
+		else if (pgwsHistoryPeriod && pgwsProfilePeriod)
 			actual_timeout = Min(history_timeout, profile_timeout);
 
 		rc = WaitLatchCompat(MyLatch,
 				WL_LATCH_SET | WL_POSTMASTER_DEATH |
-					(HistoryPeriod || ProfilePeriod ? WL_TIMEOUT : 0),
+					(pgwsHistoryPeriod || pgwsProfilePeriod ? WL_TIMEOUT : 0),
 				actual_timeout, PG_WAIT_EXTENSION);
 
 		if (rc & WL_POSTMASTER_DEATH)

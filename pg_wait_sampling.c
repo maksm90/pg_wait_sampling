@@ -21,6 +21,7 @@
 #endif
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #if PG_VERSION_NUM >= 140000
@@ -38,16 +39,15 @@ PG_MODULE_MAGIC;
 static bool shmem_initialized = false;
 
 /* Global settings */
-int MaxProfileEntries = 5000;
-int HistoryBufferSize = 5000;
-int HistoryPeriod = 0;
-int ProfilePeriod = 10;
-bool WhetherProfilePid = true;
-bool WhetherProfileQueryId = true;
+int pgwsMaxProfileEntries = 5000;
+int pgwsHistoryBufferSize = 5000;
+int pgwsHistoryPeriod = 0;
+int pgwsProfilePeriod = 10;
+bool pgwsWhetherProfilePid = true;
+bool pgwsWhetherProfileQueryId = true;
 
 /* Function declarations */
 void _PG_init(void);
-// TODO: add void _PG_fini(void);
 
 /* Hooks */
 static ExecutorStart_hook_type	prev_ExecutorStart = NULL;
@@ -141,10 +141,10 @@ pgws_shmem_size(void)
 	Size size = 0;
 
 	size = add_size(size, sizeof(pgwsQueryId) * get_max_procs_count());
-	size = add_size(size, hash_estimate_size(MaxProfileEntries,
+	size = add_size(size, hash_estimate_size(pgwsMaxProfileEntries,
 											 sizeof(ProfileHashEntry)));
 	size = add_size(size,
-					sizeof(History) + sizeof(HistoryItem) * HistoryBufferSize);
+			sizeof(History) + sizeof(HistoryItem) * pgwsHistoryBufferSize);
 
 	return size;
 }
@@ -166,35 +166,37 @@ setup_gucs()
 {
 	DefineCustomIntVariable("pg_wait_sampling.max_profile_entries",
 			"Sets maximum number of entries in bounded profile table.", NULL,
-			&MaxProfileEntries, 5000, 100, INT_MAX,
+			&pgwsMaxProfileEntries, 5000, 100, INT_MAX,
 			PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pg_wait_sampling.history_size",
 			"Sets size for ring buffer for waits history in bytes.", NULL,
-			&HistoryBufferSize, 5000, 100, INT_MAX,
+			&pgwsHistoryBufferSize, 5000, 100, INT_MAX,
 			PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pg_wait_sampling.history_period",
 			"Sets period of waits history sampling in milliseconds.",
 			"0 disables history populating.",
-			&HistoryPeriod, 0, 0, INT_MAX,
-			PGC_SIGHUP, 0, NULL, NULL, NULL);
+			&pgwsHistoryPeriod, 0, 0, INT_MAX,
+			PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pg_wait_sampling.profile_period",
 			"Sets period of waits profile sampling in milliseconds.",
 			"0 disables profiling.",
-			&ProfilePeriod, 10, 0, INT_MAX,
-			PGC_SIGHUP, 0, NULL, NULL, NULL);
+			&pgwsProfilePeriod, 10, 0, INT_MAX,
+			PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pg_wait_sampling.profile_pid",
 			"Sets whether profile should be collected per pid.", NULL,
-			&WhetherProfilePid, true,
+			&pgwsWhetherProfilePid, true,
 			PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pg_wait_sampling.profile_queries",
 			"Sets whether profile should be collected per query.", NULL,
-			&WhetherProfileQueryId, true,
+			&pgwsWhetherProfileQueryId, true,
 			PGC_POSTMASTER, 0, NULL, pgwsEnableQueryId, NULL);
+
+	EmitWarningsOnPlaceholders("pg_wait_sampling");
 }
 
 #if PG_VERSION_NUM >= 150000
@@ -234,7 +236,6 @@ pgws_shmem_startup(void)
 			"pg_wait_sampling queryids",
 			sizeof(pgwsQueryId) * get_max_procs_count(),
 			&found);
-	MemSet(pgws_proc_queryids, 0, sizeof(pgwsQueryId) * get_max_procs_count());
 	if (!found)
 	{
 		/* First time through ... */
@@ -242,19 +243,24 @@ pgws_shmem_startup(void)
 
 		pgws_profile_lock = &(locks[0]).lock;
 		pgws_history_lock = &(locks[1]).lock;
+
+		MemSet(pgws_proc_queryids, 0,
+			   sizeof(pgwsQueryId) * get_max_procs_count());
 	}
 
 	pgws_history_ring = ShmemInitStruct(
 			"pg_wait_sampling history ring",
-			sizeof(History) + sizeof(HistoryItem) * HistoryBufferSize,
+			sizeof(History) + sizeof(HistoryItem) * pgwsHistoryBufferSize,
 			&found);
-	pgws_history_ring->index = 0;
+	if (!found)
+		pgws_history_ring->index = 0;
 
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(ProfileHashKey);
 	info.entrysize = sizeof(ProfileHashEntry);
 	pgws_profile_hash = ShmemInitHash("pg_wait_sampling hash",
-									  MaxProfileEntries, MaxProfileEntries,
+									  pgwsMaxProfileEntries,
+									  pgwsMaxProfileEntries,
 									  &info, HASH_ELEM | HASH_BLOBS);
 
 	LWLockRelease(AddinShmemInitLock);
@@ -340,32 +346,6 @@ _PG_init(void)
 	ExecutorEnd_hook		= pgws_ExecutorEnd;
 }
 
-/*
- * Find PGPROC entry responsible for given pid assuming ProcArrayLock was
- * already taken.
- */
-static PGPROC *
-search_proc(int pid)
-{
-	int i;
-
-	if (pid == 0)
-		return MyProc;
-
-	for (i = 0; i < ProcGlobal->allProcCount; i++)
-	{
-		PGPROC	*proc = &ProcGlobal->allProcs[i];
-		if (proc->pid && proc->pid == pid)
-		{
-			return proc;
-		}
-	}
-
-	ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-					errmsg("backend with pid=%d not found", pid)));
-	return NULL;
-}
-
 typedef struct
 {
 	HistoryItem	   *items;
@@ -405,14 +385,12 @@ pg_wait_sampling_get_current(PG_FUNCTION_ARGS)
 
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
-		LWLockAcquire(ProcArrayLock, LW_SHARED);
-
 		if (!PG_ARGISNULL(0))
 		{
 			HistoryItem	   *item;
 			PGPROC		   *proc;
 
-			proc = search_proc(PG_GETARG_UINT32(0));
+			proc = BackendPidGetProc(PG_GETARG_UINT32(0));
 			params->items = (HistoryItem *) palloc0(sizeof(HistoryItem));
 			item = &params->items[0];
 			item->pid = proc->pid;
@@ -441,8 +419,6 @@ pg_wait_sampling_get_current(PG_FUNCTION_ARGS)
 			}
 			funcctx->max_calls = j;
 		}
-
-		LWLockRelease(ProcArrayLock);
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -569,7 +545,7 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 		/* Make and return next tuple to caller */
 		event_type = pgstat_get_wait_event_type(item->key.wait_event_info);
 		event = pgstat_get_wait_event(item->key.wait_event_info);
-		if (WhetherProfilePid)
+		if (pgwsWhetherProfilePid)
 			values[0] = Int32GetDatum(item->key.pid);
 		else
 			nulls[0] = true;
@@ -582,7 +558,7 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 		else
 			nulls[2] = true;
 
-		if (WhetherProfileQueryId)
+		if (pgwsWhetherProfileQueryId)
 			values[3] = UInt64GetDatum(item->key.queryid);
 		else
 			nulls[3] = true;
@@ -652,8 +628,8 @@ pg_wait_sampling_get_history(PG_FUNCTION_ARGS)
 		/* Extract history from shared ring buffer */
 		LWLockAcquire(pgws_history_lock, LW_SHARED);
 
-		history_size = pgws_history_ring->index < HistoryBufferSize ?
-			pgws_history_ring->index : HistoryBufferSize;
+		history_size = pgws_history_ring->index < pgwsHistoryBufferSize ?
+			pgws_history_ring->index : pgwsHistoryBufferSize;
 		history = (HistoryItem *) palloc(history_size * sizeof(HistoryItem));
 		memcpy(history, pgws_history_ring->items,
 			   history_size * sizeof(HistoryItem));
